@@ -13,6 +13,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.PowerManager
+import android.os.Build
 import android.widget.Toast
 import androidx.annotation.RequiresPermission
 import androidx.core.app.ActivityCompat
@@ -831,21 +832,27 @@ class ListenTogetherClient
         }
 
         private fun ensureNotificationChannel() {
-            try {
-                val nm = context.getSystemService(NotificationManager::class.java)
-                val existing = nm?.getNotificationChannel(NOTIFICATION_CHANNEL_ID)
-                if (existing == null) {
-                    val channel =
-                        NotificationChannel(
-                            NOTIFICATION_CHANNEL_ID,
-                            context.getString(R.string.listen_together_notification_channel_name),
-                            NotificationManager.IMPORTANCE_HIGH,
-                        )
-                    channel.description = context.getString(R.string.listen_together_notification_channel_desc)
-                    nm?.createNotificationChannel(channel)
+            // Only execute this code if the device is running Android 8.0 (API 26) or higher
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                try {
+                    val nm = context.getSystemService(NotificationManager::class.java)
+                    val existing = nm?.getNotificationChannel(NOTIFICATION_CHANNEL_ID)
+                    if (existing == null) {
+                        val channel =
+                            NotificationChannel(
+                                NOTIFICATION_CHANNEL_ID,
+                                context.getString(R.string.listen_together_notification_channel_name),
+                                NotificationManager.IMPORTANCE_HIGH,
+                            )
+                        channel.description = context.getString(R.string.listen_together_notification_channel_desc)
+                        nm?.createNotificationChannel(channel)
+                    }
+                } catch (e: Exception) {
+                    log(LogLevel.WARNING, "Failed to create notification channel", e.message)
                 }
-            } catch (e: Exception) {
-                log(LogLevel.WARNING, "Failed to create notification channel", e.message)
+            } else {
+                // Optional: Log that we are skipping this on older Android versions
+                log(LogLevel.INFO, "Skipping notification channel creation: device is below Android 8.0")
             }
         }
 

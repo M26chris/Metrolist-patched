@@ -1,0 +1,6 @@
+Successfully parsed. contents is null? false
+tabbedSearchResultsRenderer is null? false
+tabs count = 1
+tab is null? false
+sectionList is null? false
+sectionList contents count = 30

@@ -96,9 +96,30 @@ class InnerTube {
                 readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                 writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
                 
-                // Enable HTTP/2 for better performance
-                protocols(listOf(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.HTTP_1_1))
-                
+                // Use HTTP/1.1 only — HTTP/2 requires ALPN which Android 7's
+                // TLS stack does not support reliably, causing silent connection
+                // failures on API 24. HTTP/1.1 works correctly on all versions.
+                protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+
+                // Explicitly enable TLS 1.2 for Android 7 (API 24) which does
+                // not enable it by default on all connections.
+                try {
+                    val sc = javax.net.ssl.SSLContext.getInstance("TLSv1.2")
+                    sc.init(null, null, null)
+                    val tmf = javax.net.ssl.TrustManagerFactory.getInstance(
+                        javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm()
+                    )
+                    tmf.init(null as java.security.KeyStore?)
+                    val trustManager = tmf.trustManagers[0] as javax.net.ssl.X509TrustManager
+                    sslSocketFactory(sc.socketFactory, trustManager)
+                    connectionSpecs(
+                        listOf(
+                            okhttp3.ConnectionSpec.MODERN_TLS,
+                            okhttp3.ConnectionSpec.COMPATIBLE_TLS,
+                        )
+                    )
+                } catch (_: Exception) {}
+
                 // Retry on connection failure
                 retryOnConnectionFailure(true)
                 

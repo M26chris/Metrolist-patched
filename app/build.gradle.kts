@@ -92,7 +92,7 @@ android {
 
     defaultConfig {
         applicationId = applicationIdOverride ?: baseApplicationId
-        minSdk = 26
+        minSdk = 23
         targetSdk = 36
         versionCode = 147
         versionName = "13.4.3"

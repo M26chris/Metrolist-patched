@@ -72,8 +72,30 @@ object SearchSuggestionPage {
                 val isUnfilteredSearch = firstSubtitle == "Episode"
                 val dateIndex = if (isUnfilteredSearch) 1 else 0
                 val podcastIndex = if (isUnfilteredSearch) 2 else 1
+                
+                // UPDATED: Added 4-tier deep fallback for videoId extraction
+                val itemId = renderer.playlistItemData?.videoId
+                    ?: renderer.navigationEndpoint?.watchEndpoint?.videoId
+                    ?: renderer.overlay
+                        ?.musicItemThumbnailOverlayRenderer
+                        ?.content
+                        ?.musicPlayButtonRenderer
+                        ?.playNavigationEndpoint
+                        ?.watchEndpoint
+                        ?.videoId
+                    ?: renderer.flexColumns
+                        .firstOrNull()
+                        ?.musicResponsiveListItemFlexColumnRenderer
+                        ?.text
+                        ?.runs
+                        ?.firstOrNull()
+                        ?.navigationEndpoint
+                        ?.watchEndpoint
+                        ?.videoId
+                    ?: return null
+
                 EpisodeItem(
-                    id = renderer.playlistItemData?.videoId ?: return null,
+                    id = itemId,
                     title =
                         renderer.flexColumns
                             .firstOrNull()
@@ -165,8 +187,30 @@ object SearchSuggestionPage {
                     ?.firstOrNull()
                     ?.splitArtistsByConjunction()
                     ?.filter { it.text.isNotBlank() && it.text != "&" && it.text != "," }
+                
+                // UPDATED: Replaced fragile single-check with 4-tier deep fallback for videoId extraction
+                val itemId = renderer.playlistItemData?.videoId
+                    ?: renderer.navigationEndpoint?.watchEndpoint?.videoId
+                    ?: renderer.overlay
+                        ?.musicItemThumbnailOverlayRenderer
+                        ?.content
+                        ?.musicPlayButtonRenderer
+                        ?.playNavigationEndpoint
+                        ?.watchEndpoint
+                        ?.videoId
+                    ?: renderer.flexColumns
+                        .firstOrNull()
+                        ?.musicResponsiveListItemFlexColumnRenderer
+                        ?.text
+                        ?.runs
+                        ?.firstOrNull()
+                        ?.navigationEndpoint
+                        ?.watchEndpoint
+                        ?.videoId
+                    ?: return null
+
                 SongItem(
-                    id = renderer.playlistItemData?.videoId ?: return null,
+                    id = itemId,
                     title =
                         renderer.flexColumns
                             .firstOrNull()

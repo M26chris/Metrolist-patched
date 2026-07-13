@@ -185,8 +185,10 @@ fun OnlineSearchResult(
         remember {
             { searchQuery ->
                 if (searchQuery.isNotEmpty()) {
+                    // Hide suggestions overlay so results are visible after navigation
                     isSearchFocused = false
                     focusManager.clearFocus()
+                    keyboardController?.hide()
 
                     navController.navigate("search/${URLEncoder.encode(searchQuery, "UTF-8")}") {
                         popUpTo("search/${URLEncoder.encode(decodedQuery, "UTF-8")}") {
@@ -205,9 +207,14 @@ fun OnlineSearchResult(
             }
         }
 
-    // Update query when decodedQuery changes
+    // Sync query text when navigation args change, and always show results (not suggestions)
+    // for a committed search. Without this, a focused field / stuck isSearchFocused keeps
+    // OnlineSearchScreen covering the result list even after SUCCESS from the API.
     LaunchedEffect(decodedQuery) {
         query = TextFieldValue(decodedQuery, TextRange(decodedQuery.length))
+        isSearchFocused = false
+        focusManager.clearFocus()
+        keyboardController?.hide()
     }
 
     // Clear video filter if hideVideoSongs setting is enabled and filter is set to FILTER_VIDEO
@@ -451,9 +458,9 @@ fun OnlineSearchResult(
                     .padding(horizontal = 16.dp, vertical = 8.dp)
                     .focusRequester(focusRequester)
                     .onFocusChanged { focusState ->
-                        if (focusState.isFocused) {
-                            isSearchFocused = true
-                        }
+                        // Track both gain and loss of focus. Previously only true was set, so
+                        // the suggestions overlay could stay up and hide search results forever.
+                        isSearchFocused = focusState.isFocused
                     },
         )
 
@@ -487,6 +494,12 @@ fun OnlineSearchResult(
                     chips = visibleChips,
                     currentValue = searchFilter,
                     onValueUpdate = {
+                        // Interacting with filters means the user wants results, not suggestions
+                        if (isSearchFocused) {
+                            isSearchFocused = false
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        }
                         if (viewModel.filter.value != it) {
                             viewModel.filter.value = it
                         }

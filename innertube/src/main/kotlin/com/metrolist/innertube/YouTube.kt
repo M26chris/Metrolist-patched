@@ -157,7 +157,16 @@ object YouTube {
 
     suspend fun searchSummary(query: String): Result<SearchSummaryPage> =
         runCatching {
+            Timber.d("SEARCH_DEBUG: searchSummary called, query=$query")
             val response = innerTube.search(WEB_REMIX, query).body<SearchResponse>()
+            Timber.d("SEARCH_DEBUG: response received, contents=${response.contents != null}")
+            Timber.d("SEARCH_DEBUG: tabbedSearchResultsRenderer=${response.contents?.tabbedSearchResultsRenderer != null}")
+            val tabs = response.contents?.tabbedSearchResultsRenderer?.tabs
+            Timber.d("SEARCH_DEBUG: tabs count=${tabs?.size}")
+            val firstTab = tabs?.firstOrNull()
+            Timber.d("SEARCH_DEBUG: firstTab=${firstTab != null}, tabRenderer=${firstTab?.tabRenderer != null}")
+            val sections = firstTab?.tabRenderer?.content?.sectionListRenderer?.contents
+            Timber.d("SEARCH_DEBUG: sections count=${sections?.size}")
             val allSummaries = mutableListOf<SearchSummary>()
 
             response.contents
@@ -195,21 +204,30 @@ object YouTube {
                                 ),
                             )
                         }
-                    } else if (section.musicShelfRenderer != null) {
-                        val items =
-                            section.musicShelfRenderer.contents
-                                ?.getItems()
-                                ?.mapNotNull { SearchSummaryPage.fromMusicResponsiveListItemRenderer(it) }
-                                ?.distinctBy { it.id }
-                                ?: emptyList()
+                    } else {
+                        val items = mutableListOf<YTItem>()
+                        var apiTitle: String? = null
+
+                        if (section.musicShelfRenderer != null) {
+                            items.addAll(
+                                section.musicShelfRenderer.contents
+                                    ?.getItems()
+                                    ?.mapNotNull { SearchSummaryPage.fromMusicResponsiveListItemRenderer(it) }
+                                    ?.distinctBy { it.id }
+                                    ?: emptyList()
+                            )
+                            apiTitle = section.musicShelfRenderer.title?.runs?.firstOrNull()?.text
+                        } else if (section.itemSectionRenderer != null) {
+                            items.addAll(
+                                section.itemSectionRenderer.contents
+                                    ?.mapNotNull { it.musicResponsiveListItemRenderer }
+                                    ?.mapNotNull { SearchSummaryPage.fromMusicResponsiveListItemRenderer(it) }
+                                    ?.distinctBy { it.id }
+                                    ?: emptyList()
+                            )
+                        }
 
                         if (items.isEmpty()) return@forEach
-
-                        val apiTitle =
-                            section.musicShelfRenderer.title
-                                ?.runs
-                                ?.firstOrNull()
-                                ?.text
 
                         if (apiTitle != null) {
                             // API provided a title, use single section

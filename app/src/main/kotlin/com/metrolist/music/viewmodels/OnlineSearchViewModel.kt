@@ -50,23 +50,23 @@ constructor(
 
     private suspend fun loadSummaryPage() {
         if (summaryPage == null) {
+            android.util.Log.d("SEARCH_DEBUG", "loadSummaryPage: starting search for query=$query")
                     YouTube
                         .searchSummary(query)
                         .onSuccess { page ->
-                            val resolvedSummaries = page.summaries.map { summary ->
-                                summary.copy(items = YouTube.resolveArtistIds(summary.items))
-                            }
-                            val resolvedPage = page.copy(summaries = resolvedSummaries)
+                            android.util.Log.d("SEARCH_DEBUG", "loadSummaryPage: SUCCESS, summaries=${page.summaries.size}")
                             val hideExplicit = context.dataStore.get(HideExplicitKey, false)
                             val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
                             val hideYoutubeShorts = context.dataStore.get(HideYoutubeShortsKey, false)
                             summaryPage =
-                                resolvedPage.filterExplicit(hideExplicit)
+                                page.filterExplicit(hideExplicit)
                                   .filterVideoSongs(hideVideoSongs)
                                   .filterYoutubeShorts(hideYoutubeShorts)
-                }.onFailure {
-                    reportException(it)
-                }
+                            android.util.Log.d("SEARCH_DEBUG", "loadSummaryPage: summaryPage set, sections=${summaryPage?.summaries?.size}")
+                        }.onFailure {
+                            android.util.Log.e("SEARCH_DEBUG", "loadSummaryPage: FAILED - ${it.javaClass.name}: ${it.message}", it)
+                            reportException(it)
+                        }
         }
     }
 

@@ -11,6 +11,7 @@ import com.metrolist.innertube.models.BrowseEndpoint.BrowseEndpointContextSuppor
 import com.metrolist.innertube.models.BrowseEndpoint.BrowseEndpointContextSupportedConfigs.BrowseEndpointContextMusicConfig.Companion.MUSIC_PAGE_TYPE_NON_MUSIC_AUDIO_TRACK_PAGE
 import com.metrolist.innertube.models.BrowseEndpoint.BrowseEndpointContextSupportedConfigs.BrowseEndpointContextMusicConfig.Companion.MUSIC_PAGE_TYPE_USER_CHANNEL
 import kotlinx.serialization.ExperimentalSerializationApi
+import com.metrolist.innertube.utils.ParserDebugger
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonNames
 
@@ -89,6 +90,93 @@ data class MusicResponsiveListItemRenderer(
                 ?.playNavigationEndpoint
                 ?.musicVideoType
                 ?: navigationEndpoint?.musicVideoType
+
+    fun debugClassification() {
+        val pageType =
+            navigationEndpoint?.browseEndpoint
+                ?.browseEndpointContextSupportedConfigs
+                ?.browseEndpointContextMusicConfig
+                ?.pageType
+
+        val title =
+            flexColumns.firstOrNull()
+                ?.musicResponsiveListItemFlexColumnRenderer
+                ?.text?.runs
+                ?.firstOrNull()
+                ?.text
+
+        val subtitle =
+            flexColumns.getOrNull(1)
+                ?.musicResponsiveListItemFlexColumnRenderer
+                ?.text?.runs
+                ?.joinToString(" | ") { it.text }
+
+        ParserDebugger.log(
+            """
+            ================================
+            SEARCH CLASSIFICATION
+            ================================
+
+            title=${
+                flexColumns.firstOrNull()
+                    ?.musicResponsiveListItemFlexColumnRenderer
+                    ?.text?.runs
+                    ?.firstOrNull()
+                    ?.text
+            }
+
+            isSong=$isSong
+            isEpisode=$isEpisode
+            isAlbum=$isAlbum
+            isArtist=$isArtist
+            isPlaylist=$isPlaylist
+            isPodcast=$isPodcast
+            isUserChannel=$isUserChannel
+
+            pageType=${
+                navigationEndpoint?.browseEndpoint
+                    ?.browseEndpointContextSupportedConfigs
+                    ?.browseEndpointContextMusicConfig
+                    ?.pageType
+            }
+
+            watchVideoId=${navigationEndpoint?.watchEndpoint?.videoId}
+            watchPlaylistVideoId=${navigationEndpoint?.watchPlaylistEndpoint?.videoId}
+
+            playlistItemVideoId=${playlistItemData?.videoId}
+
+            musicVideoType=$musicVideoType
+
+            ================================
+            """.trimIndent()
+        )
+    }
+
+    fun debugEndpoints() {
+        ParserDebugger.log(
+            """
+            ===== ENDPOINT DUMP =====
+
+            navigationEndpoint=$navigationEndpoint
+
+            watchEndpoint=${navigationEndpoint?.watchEndpoint}
+
+            watchPlaylistEndpoint=${navigationEndpoint?.watchPlaylistEndpoint}
+
+            browseEndpoint=${navigationEndpoint?.browseEndpoint}
+
+            overlayPlayEndpoint=${
+                overlay
+                    ?.musicItemThumbnailOverlayRenderer
+                    ?.content
+                    ?.musicPlayButtonRenderer
+                    ?.playNavigationEndpoint
+            }
+
+            =========================
+            """.trimIndent()
+        )
+    }
 
     @Serializable
     data class FlexColumn(
