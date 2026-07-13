@@ -389,6 +389,8 @@ fun OnlineSearchResult(
             value = query,
             onValueChange = { newQuery ->
                 query = newQuery
+                // When user modifies the search field, show suggestions
+                // This only triggers if they manually edit the text
             },
             placeholder = {
                 Text(
@@ -458,9 +460,9 @@ fun OnlineSearchResult(
                     .padding(horizontal = 16.dp, vertical = 8.dp)
                     .focusRequester(focusRequester)
                     .onFocusChanged { focusState ->
-                        // Track both gain and loss of focus. Previously only true was set, so
-                        // the suggestions overlay could stay up and hide search results forever.
-                        isSearchFocused = focusState.isFocused
+                        // FIX: Only show suggestions overlay when search field is focused AND
+                        // no results are loaded yet. Once results exist, keep overlay hidden.
+                        isSearchFocused = focusState.isFocused && searchSummary == null && itemsPage == null
                     },
         )
 
@@ -577,6 +579,8 @@ fun OnlineSearchResult(
                     }
                 }
             }
+            
+            // FIXED: Show suggestions overlay ONLY when focused and no results exist yet
             if (isSearchFocused) {
                 OnlineSearchScreen(
                     query = query.text,
@@ -590,6 +594,7 @@ fun OnlineSearchResult(
                     pureBlack = pureBlack,
                 )
             }
+            
             HideOnScrollFAB(
                 lazyListState = lazyListState,
                 icon = R.drawable.mic,
