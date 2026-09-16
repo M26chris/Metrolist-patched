@@ -1079,16 +1079,16 @@ object YouTube {
                         playEndpoint = null,
                         shuffleEndpoint =
                             header.buttons
-                                .lastOrNull()
+                                ?.lastOrNull()
                                 ?.menuRenderer
                                 ?.items
                                 ?.firstOrNull()
                                 ?.menuNavigationItemRenderer
                                 ?.navigationEndpoint
-                                ?.watchPlaylistEndpoint!!,
+                                ?.watchPlaylistEndpoint,
                         radioEndpoint =
                             header.buttons
-                                .getOrNull(2)
+                                ?.getOrNull(2)
                                 ?.menuRenderer
                                 ?.items
                                 ?.find {
