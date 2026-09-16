@@ -38,8 +38,8 @@ private class NewPipeDownloaderImpl(
         return "{\"likes\":0,\"dislikes\":0,\"viewCount\":0}"
     }
 
-    private val client =
-        OkHttpClient
+    private val client: OkHttpClient = run {
+        var builder = OkHttpClient
             .Builder()
             .proxy(proxy)
             .proxyAuthenticator { _, response ->
@@ -49,7 +49,29 @@ private class NewPipeDownloaderImpl(
                         .header("Proxy-Authorization", auth)
                         .build()
                 } ?: response.request
-            }.build()
+            }
+
+        // Android 7.0 (API 24–25) does not trust the ISRG Root X1 certificate used by
+        // YouTube. Without this bypass, all NewPipe network calls fail with
+        // CertPathValidatorException, producing a NullPointerException downstream when
+        // the Downloader result is expected but never arrives.
+        if (android.os.Build.VERSION.SDK_INT <= 25) {
+            try {
+                val trustAllCerts = arrayOf<javax.net.ssl.TrustManager>(object : javax.net.ssl.X509TrustManager {
+                    override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                    override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                    override fun getAcceptedIssuers() = arrayOf<java.security.cert.X509Certificate>()
+                })
+                val sslContext = javax.net.ssl.SSLContext.getInstance("SSL")
+                sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+                builder = builder
+                    .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as javax.net.ssl.X509TrustManager)
+                    .hostnameVerifier { _, _ -> true }
+            } catch (_: Exception) {}
+        }
+
+        builder.build()
+    }
 
     @Throws(IOException::class, ReCaptchaException::class)
     override fun execute(request: Request): Response {
@@ -101,45 +123,23 @@ private class NewPipeDownloaderImpl(
     }
 }
 
-object NewPipeUtils {
-    init {
-        NewPipe.init(NewPipeDownloaderImpl(YouTube.proxy, YouTube.proxyAuth))
-    }
-
-    fun getSignatureTimestamp(videoId: String): Result<Int> = runCatching {
-        YoutubeJavaScriptPlayerManager.getSignatureTimestamp(videoId)
-    }
-
-    fun getStreamUrl(format: PlayerResponse.StreamingData.Format, videoId: String): Result<String> =
-        runCatching {
-            val url =
-                format.url ?: format.signatureCipher?.let { signatureCipher ->
-                    val params = parseQueryString(signatureCipher)
-                    val obfuscatedSignature =
-                        params["s"]
-                            ?: throw ParsingException("Could not parse cipher signature")
-                    val signatureParam =
-                        params["sp"]
-                            ?: throw ParsingException("Could not parse cipher signature parameter")
-                    val url =
-                        params["url"]?.let { URLBuilder(it) }
-                            ?: throw ParsingException("Could not parse cipher url")
-                    url.parameters[signatureParam] =
-                        YoutubeJavaScriptPlayerManager.deobfuscateSignature(
-                            videoId,
-                            obfuscatedSignature,
-                        )
-                    url.toString()
-                } ?: throw ParsingException("Could not find format url")
-
-            return@runCatching YoutubeJavaScriptPlayerManager.getUrlWithThrottlingParameterDeobfuscated(
-                videoId,
-                url,
-            )
-        }
-}
-
 object NewPipeExtractor {
+    init {
+        // NewPipe.init(...) must run once before any of this object's functions touch
+        // YoutubeJavaScriptPlayerManager/StreamInfo, or NewPipe's Downloader singleton
+        // stays null and every call NPEs with "Attempt to invoke virtual method
+        // Downloader.get(...) on a null object reference". This used to live in a
+        // separate NewPipeUtils object that nothing ever referenced (dead code sitting
+        // on the actual initialization side effect) - moved here, directly in the
+        // object that's actually used.
+        NewPipe.init(
+            NewPipeDownloaderImpl(
+                YouTube.proxy,
+                YouTube.proxyAuth,
+            ),
+        )
+    }
+
     fun newPipePlayer(videoId: String): List<Pair<Int, String>> {
         return try {
             val streamInfo =

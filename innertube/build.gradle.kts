@@ -32,6 +32,10 @@ dependencies {
     implementation("com.github.MetrolistGroup:MetrolistExtractor:6305155") {
         exclude(group = "com.google.protobuf")
     }
+    // Extraction/cipher/client-fallback engine used by InnerTubeXPlayer.kt (app module).
+    // `api` (not `implementation`) so its com.metrolist.innertubex.* classes are visible on
+    // :app's compile classpath, same as upstream MetrolistGroup/Metrolist does it.
+    api(libs.innertubex)
     implementation(libs.timber)
     testImplementation(libs.junit)
 

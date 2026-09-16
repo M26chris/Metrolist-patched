@@ -36,8 +36,12 @@ kuromojiIpadic = "0.9.0"
 extractor = "6305155"
 tinypinyin = "2.0.3"
 protobuf = "4.34.1"
+conscrypt = "2.5.3"
+innertubex = "v0.5.2"
 
 [libraries]
+conscrypt-android = { module = "org.conscrypt:conscrypt-android", version.ref = "conscrypt" }
+innertubex = { module = "com.github.MetrolistGroup.innertubex:innertubex", version.ref = "innertubex" }
 guava = { module = "com.google.guava:guava", version.ref = "guava" }
 coroutines-guava = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-guava", version.ref = "coroutinesGuava" }
 concurrent-futures = { module = "androidx.concurrent:concurrent-futures-ktx", version.ref = "concurrentFutures" }

@@ -189,8 +189,10 @@ import com.metrolist.music.utils.CoilBitmapLoader
 import com.metrolist.music.utils.DiscordRPC
 import com.metrolist.music.utils.NetworkConnectivityObserver
 import com.metrolist.music.utils.ScrobbleManager
+import com.metrolist.music.utils.StreamDiagnosticsInterceptor
 import com.metrolist.music.utils.SyncUtils
 import com.metrolist.music.utils.YTPlayerUtils
+import com.metrolist.music.utils.InnerTubeXPlayer
 import com.metrolist.music.utils.dataStore
 import com.metrolist.music.utils.get
 import com.metrolist.music.utils.reportException
@@ -440,9 +442,23 @@ class MusicService :
     private var cachedAutoLoadMore = true
 
     // URL cache for stream URLs - class-level so it can be invalidated on errors
+    private data class CachedStreamUrl(
+        val url: String,
+        val expiresAt: Long,
+        // See YTPlayerUtils.PlaybackData.isPoTokenBased - these entries are never read back
+        // for a subsequent chunk request; only kept here so callers can still see/invalidate
+        // them the same way as any other cached URL.
+        val isPoTokenBased: Boolean,
+        // Which client actually produced this URL (e.g. "WEB_REMIX"). Read in onPlayerError
+        // before performAggressiveCacheClear() wipes this entry, so a 403 can be attributed
+        // to the right client via InnerTubeXPlayer.markStreamClientFailed() - otherwise the
+        // next attempt for this video has no way to know which client to exclude.
+        val streamClient: String,
+    )
+
     private val songUrlCache = Collections.synchronizedMap(
-        object : LinkedHashMap<String, Pair<String, Long>>(0, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, Long>>): Boolean {
+        object : LinkedHashMap<String, CachedStreamUrl>(0, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedStreamUrl>): Boolean {
                 return size > 500
             }
         }
@@ -2800,6 +2816,10 @@ class MusicService :
             .w(error, "Player error occurred for $mediaId: errorCode=${error.errorCode}, message=${error.message}")
         reportException(error)
 
+        // Capture before performAggressiveCacheClear() below wipes the songUrlCache entry -
+        // this is the only place that still knows which client produced the URL that failed.
+        val failedClient = mediaId?.let { songUrlCache[it]?.streamClient }
+
         // Check if this song has failed too many times
         if (mediaId != null && hasExceededRetryLimit(mediaId)) {
             Timber.tag(TAG).w("Song $mediaId has exceeded retry limit, skipping")
@@ -2835,6 +2855,13 @@ class MusicService :
 
             isExpiredUrlError(error) -> {
                 Timber.tag(TAG).d("Expired URL (403) detected, refreshing stream URL")
+                if (mediaId != null && !failedClient.isNullOrBlank()) {
+                    // Exclude this client from the next extraction attempt for this video
+                    // (5-minute TTL - see InnerTubeXPlayer.kt). Without this, a client that
+                    // just hit e.g. the 1 MiB PoToken quota would likely be picked again on
+                    // the very next retry, since nothing else marks it as bad.
+                    InnerTubeXPlayer.markStreamClientFailed(mediaId, failedClient)
+                }
                 handleExpiredUrlError(mediaId)
                 return
             }
@@ -3220,7 +3247,13 @@ class MusicService :
                                                 .header("Proxy-Authorization", auth)
                                                 .build()
                                         } ?: response.request
-                                    }.build(),
+                                    }
+                                    // Temporary instrumentation to get hard evidence on the
+                                    // PoToken mid-stream 403 instead of inferring from
+                                    // timestamps alone. See StreamDiagnosticsInterceptor's
+                                    // kdoc. Remove once we've confirmed the actual mechanism.
+                                    .addNetworkInterceptor(StreamDiagnosticsInterceptor)
+                                    .build(),
                             ),
                         ),
                     ),
@@ -3411,6 +3444,61 @@ class MusicService :
         }
     }
 
+    /**
+     * Resolves playback data for a video, preferring InnerTubeXPlayer's extractor (per-video
+     * client-failure tracking with a 5-minute TTL - see InnerTubeXPlayer.kt's kdoc) and
+     * falling back to the older YTPlayerUtils path if that fails for any reason. This keeps
+     * everything YTPlayerUtils.kt/MusicService.kt already do correctly (TLS handling, the
+     * PoToken-fallback-candidate ordering, streamValidated gating) as a safety net rather
+     * than replacing it outright with code that hasn't been through a real device yet.
+     *
+     * Both branches return the same YTPlayerUtils.PlaybackData shape so nothing downstream
+     * of this function needs to know which resolver actually produced it.
+     */
+    private suspend fun resolvePlaybackData(
+        mediaId: String,
+        audioQuality: com.metrolist.music.constants.AudioQuality,
+    ): Result<YTPlayerUtils.PlaybackData> {
+        val innerTubeXResult = InnerTubeXPlayer.playerResponseForPlayback(
+            videoId = mediaId,
+            audioQuality = audioQuality,
+            connectivityManager = connectivityManager,
+        )
+        innerTubeXResult.onSuccess { data ->
+            Timber.tag(TAG).i("Resolved $mediaId via InnerTubeXPlayer (client=${data.streamClient})")
+            return Result.success(
+                YTPlayerUtils.PlaybackData(
+                    audioConfig = data.audioConfig,
+                    videoDetails = data.videoDetails,
+                    playbackTracking = data.playbackTracking,
+                    format = data.format,
+                    streamUrl = data.streamUrl,
+                    streamExpiresInSeconds = data.streamExpiresInSeconds,
+                    // Reuses the existing isPoTokenBased cache-skip gate (see songUrlCache
+                    // below): "this stream needs chunked range requests" implies the same
+                    // "don't reuse this URL for a later chunk" caution isPoTokenBased was
+                    // already applying, so map it straight across rather than adding a
+                    // second, parallel skip-cache condition.
+                    isPoTokenBased = data.useRangeChunks,
+                    streamClient = data.streamClient,
+                    streamHeaders = data.streamHeaders,
+                    requireBoundedRange = data.requireBoundedRange,
+                    rangeChunkSizeBytes = data.rangeChunkSizeBytes,
+                    useRangeChunks = data.useRangeChunks,
+                ),
+            )
+        }
+        Timber.tag(TAG).w(
+            innerTubeXResult.exceptionOrNull(),
+            "InnerTubeXPlayer failed to resolve $mediaId - falling back to YTPlayerUtils",
+        )
+        return YTPlayerUtils.playerResponseForPlayback(
+            mediaId,
+            audioQuality = audioQuality,
+            connectivityManager = connectivityManager,
+        )
+    }
+
     private fun createDataSourceFactory(): DataSource.Factory {
         return ResolvingDataSource.Factory(createCacheDataSource()) { dataSpec ->
             val mediaId = dataSpec.key ?: error("No media id")
@@ -3431,18 +3519,32 @@ class MusicService :
                 }
 
                 if (usePlayerCache && playerCache.isCached(mediaId, dataSpec.position, CHUNK_LENGTH)) {
-                    songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let { (url, _) ->
-                        scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
-                        return@Factory dataSpec.withUri(url.toUri())
-                    }
+                    songUrlCache[mediaId]
+                        ?.takeIf { it.expiresAt > System.currentTimeMillis() && !it.isPoTokenBased }
+                        ?.let { cached ->
+                            scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
+                            return@Factory dataSpec.withUri(cached.url.toUri())
+                        }
                     Timber.tag(TAG).w("Ghost cache entry for $mediaId, re-fetching")
                     playerCache.removeResource(mediaId)
                 }
 
-                songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
-                    scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
-                    return@Factory dataSpec.withUri(it.first.toUri())
+                songUrlCache[mediaId]
+                    ?.takeIf { it.expiresAt > System.currentTimeMillis() && !it.isPoTokenBased }
+                    ?.let { cached ->
+                        scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
+                        return@Factory dataSpec.withUri(cached.url.toUri())
+                    }
+                songUrlCache[mediaId]?.takeIf { it.isPoTokenBased }?.let {
+                    Timber.tag("Metrolist_StreamDiag").d(
+                        "$mediaId: skipping cached PoToken URL for offset=${dataSpec.uriPositionOffset} - forcing fresh resolution instead of a 2nd request to the same URL"
+                    )
                 }
+                // PoToken-based cache entries (WEB_REMIX/TVHTML5) are deliberately never
+                // reused here for a later chunk - see PlaybackData.isPoTokenBased. Falling
+                // through re-fetches a fresh signed URL for every chunk of those streams,
+                // trading some extra latency per chunk for not handing ExoPlayer a URL
+                // that's already been used for one range and may be rejected for a second.
             } else {
                 Timber.tag(TAG).i("BYPASSING CACHE for $mediaId due to quality change")
             }
@@ -3450,10 +3552,9 @@ class MusicService :
             Timber.tag(TAG).i("FETCHING STREAM: $mediaId | quality=$audioQuality")
             val playbackData =
                 runBlocking(Dispatchers.IO) {
-                    YTPlayerUtils.playerResponseForPlayback(
+                    resolvePlaybackData(
                         mediaId,
                         audioQuality = audioQuality,
-                        connectivityManager = connectivityManager,
                     )
                 }.getOrElse { throwable ->
                     when (throwable) {
@@ -3529,8 +3630,32 @@ class MusicService :
                 val streamUrl = nonNullPlayback.streamUrl
 
                 songUrlCache[mediaId] =
-                    streamUrl to System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L)
-                return@Factory dataSpec.withUri(streamUrl.toUri()).subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
+                    CachedStreamUrl(
+                        url = streamUrl,
+                        expiresAt = System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L),
+                        isPoTokenBased = nonNullPlayback.isPoTokenBased,
+                        streamClient = nonNullPlayback.streamClient,
+                    )
+
+                var resolvedSpec = dataSpec.withUri(streamUrl.toUri())
+                if (nonNullPlayback.streamHeaders.isNotEmpty()) {
+                    // e.g. a client-specific User-Agent/Origin the extractor determined this
+                    // stream needs - previously we never sent any custom headers at all here.
+                    resolvedSpec = resolvedSpec.withRequestHeaders(nonNullPlayback.streamHeaders)
+                }
+                return@Factory if (nonNullPlayback.useRangeChunks) {
+                    // Per-client chunk size from the extractor (see InnerTubeXPlayer.kt's
+                    // ContentHints/requireBoundedRange) instead of one hardcoded CHUNK_LENGTH
+                    // for every client - this is what upstream uses to keep PoToken-bound
+                    // streams (WEB_REMIX/TVHTML5) inside whatever range shape the CDN accepts
+                    // for them specifically, rather than every client getting the same 512KB
+                    // chunk regardless of whether that's actually safe for it.
+                    resolvedSpec.subrange(dataSpec.uriPositionOffset, nonNullPlayback.rangeChunkSizeBytes)
+                } else {
+                    // This client's stream doesn't need forced chunking - don't impose one
+                    // artificially; let ExoPlayer read it as a normal unbounded stream.
+                    resolvedSpec.subrange(dataSpec.uriPositionOffset, C.LENGTH_UNSET.toLong())
+                }
             }
         }
     }
@@ -4246,12 +4371,10 @@ class MusicService :
         withContext(Dispatchers.IO) {
             try {
                 val playbackData =
-                    YTPlayerUtils
-                        .playerResponseForPlayback(
-                            videoId = mediaId,
-                            audioQuality = audioQuality,
-                            connectivityManager = connectivityManager,
-                        ).getOrNull()
+                    resolvePlaybackData(
+                        mediaId,
+                        audioQuality = audioQuality,
+                    ).getOrNull()
                 playbackData?.streamUrl
             } catch (e: Exception) {
                 timber.log.Timber.e(e, "Failed to get stream URL for Cast")

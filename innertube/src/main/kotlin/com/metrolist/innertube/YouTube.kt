@@ -80,6 +80,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import timber.log.Timber
 import java.net.Proxy
+import com.metrolist.innertubex.InnerTube as InnerTubeXClient
 import kotlin.random.Random
 
 /**
@@ -126,6 +127,29 @@ object YouTube {
         set(value) {
             innerTube.useLoginForBrowse = value
         }
+
+    /**
+     * Bridge to innertubex's extraction engine (InnerTubeXPlayer.kt). Hands over the exact
+     * same Ktor/OkHttp client this object already uses for every other InnerTube call -
+     * same cookie, same proxy, same Android-7 TLS hardening in InnerTube.createClient() -
+     * rather than building a second, parallel client that could drift out of sync with it.
+     *
+     * [ExtractionTransport.generation] changes whenever cookie or proxy changes (bumped in
+     * InnerTube's setters), so InnerTubeXPlayer knows to rebuild its cached extractor/cipher
+     * service instead of holding one built against a stale client.
+     */
+    fun extractionTransport(): ExtractionTransport =
+        ExtractionTransport(
+            generation = innerTube.generation,
+            httpClient = innerTube.httpClient,
+            innerTube = InnerTubeXClient(innerTube.httpClient),
+        )
+
+    class ExtractionTransport(
+        val generation: Long,
+        val httpClient: io.ktor.client.HttpClient,
+        val innerTube: InnerTubeXClient,
+    )
 
     suspend fun searchSuggestions(query: String): Result<SearchSuggestions> =
         runCatching {
