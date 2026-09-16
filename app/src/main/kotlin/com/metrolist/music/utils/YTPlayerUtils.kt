@@ -68,6 +68,25 @@ object YTPlayerUtils {
         val format: PlayerResponse.StreamingData.Format,
         val streamUrl: String,
         val streamExpiresInSeconds: Int,
+        // True when the winning client uses PoTokens (WEB_REMIX, TVHTML5). These URLs have
+        // shown a much shorter real-world validity than streamExpiresInSeconds claims - in
+        // practice, reusing one across a second chunked range request (i.e. once ExoPlayer
+        // needs more than what the first ResolvingDataSource chunk fetched) is what's been
+        // producing "plays for a few seconds/tens of seconds, then a raw 403 mid-stream".
+        // MusicService uses this to skip caching/reusing the URL across chunks for these
+        // clients, forcing a fresh resolution per chunk instead. See MusicService.kt's
+        // createDataSourceFactory().
+        val isPoTokenBased: Boolean = false,
+        // Fields below exist so a stream resolved by InnerTubeXPlayer (see
+        // MusicService.resolvePlaybackData()) can be adapted into this same shape - the rest
+        // of MusicService.kt only needs to know one PlaybackData type. Defaulted so every
+        // existing PlaybackData(...) construction in this file (which predates these fields)
+        // keeps compiling unchanged.
+        val streamClient: String = "",
+        val streamHeaders: Map<String, String> = emptyMap(),
+        val requireBoundedRange: Boolean = false,
+        val rangeChunkSizeBytes: Long = 512 * 1024L,
+        val useRangeChunks: Boolean = true,
     )
     /**
      * Custom player response intended to use for playback.
@@ -154,6 +173,18 @@ object YTPlayerUtils {
         var streamUrl: String? = null
         var streamExpiresInSeconds: Int? = null
         var streamPlayerResponse: PlayerResponse? = null
+        // True only once validateStatus has actually returned true for the format/streamUrl
+        // currently held. Without this, if every client's stream fails validation, the loop
+        // simply ends and the code below would hand back whichever client was tried last -
+        // unvalidated - to ExoPlayer. That's what produced "plays for ~10-30s then a raw 403
+        // from OkHttpDataSource mid-stream": the CDN's real rejection was surfacing during
+        // actual playback instead of at this upfront check, where it can be handled cleanly
+        // (retry/auto-skip) instead of audibly.
+        var streamValidated = false
+        // Tracks which client ultimately produced the stream, so MusicService can decide
+        // whether the resolved URL is safe to cache and reuse across multiple chunked range
+        // requests. See PlaybackData.isPoTokenBased below.
+        var winningClient: YouTubeClient? = null
         val retryMainPlayerResponse: PlayerResponse? = if (usedAgeRestrictedClient != null) mainPlayerResponse else null
 
         // Check current status
@@ -178,6 +209,7 @@ object YTPlayerUtils {
             format = null
             streamUrl = null
             streamExpiresInSeconds = null
+            streamValidated = false
 
             // decide which client to use for streams and load its player response
             val client: YouTubeClient
@@ -291,16 +323,24 @@ object YTPlayerUtils {
                         Timber.tag(TAG).d("  URL changed: ${originalUrl != streamUrl}")
 
                         // Append pot= parameter with streaming data poToken
-                        val needsPoToken = currentClient.useWebPoTokens && poToken?.streamingDataPoToken != null
+                        // Captured into a local val: poToken is a `var` from the enclosing
+                        // scope, so Kotlin can't smart-cast it across the null-check below -
+                        // a local val can be. (A plain !! here would also compile, but adds
+                        // a crash risk for no real benefit over checking the local val once.)
+                        val currentPoToken = poToken
+                        val needsPoToken = currentClient.useWebPoTokens && currentPoToken?.streamingDataPoToken != null
                         Timber.tag(TAG).d("PoToken decision:")
                         Timber.tag(TAG).d("  needsPoToken: $needsPoToken")
-                        Timber.tag(TAG).d("  hasStreamingDataPoToken: ${poToken?.streamingDataPoToken != null}")
+                        Timber.tag(TAG).d("  hasStreamingDataPoToken: ${currentPoToken?.streamingDataPoToken != null}")
 
                         if (needsPoToken) {
-                            Timber.tag(TAG).d("Appending pot= parameter to stream URL")
-                            val separator = if ("?" in streamUrl) "&" else "?"
-                            streamUrl = "${streamUrl}${separator}pot=${Uri.encode(poToken.streamingDataPoToken)}"
-                            Timber.tag(TAG).d("  Final URL length (with pot): ${streamUrl.length}")
+                            val streamingDataPoToken = currentPoToken?.streamingDataPoToken
+                            if (streamingDataPoToken != null) {
+                                Timber.tag(TAG).d("Appending pot= parameter to stream URL")
+                                val separator = if ("?" in streamUrl) "&" else "?"
+                                streamUrl = "${streamUrl}${separator}pot=${Uri.encode(streamingDataPoToken)}"
+                                Timber.tag(TAG).d("  Final URL length (with pot): ${streamUrl.length}")
+                            }
                         }
                     } catch (e: Exception) {
                         Timber.tag(TAG).e(e, "N-transform or pot append failed: ${e.message}")
@@ -319,11 +359,22 @@ object YTPlayerUtils {
 
                 Timber.tag(logTag).d("Stream expires in: $streamExpiresInSeconds seconds")
 
-                if (clientIndex == STREAM_FALLBACK_CLIENTS.size - 1) {
-                    /** skip [validateStatus] for last client */
-                    Timber.tag(logTag).d("Using last fallback client without validation: ${STREAM_FALLBACK_CLIENTS[clientIndex].clientName}")
-                    Timber.tag(TAG)
-                        .i("Playback: client=${currentClient.clientName}, videoId=$videoId")
+                if (currentClient.useWebPoTokens) {
+                    // PoToken-authenticated URLs (WEB_REMIX/WEB/WEB_CREATOR/TVHTML5) appear
+                    // to carry a short validity window - in practice, a validateStatus
+                    // round-trip made here (after signature-timestamp fetch, cipher solving,
+                    // and PoToken generation already spent time) has repeatedly been
+                    // followed by ExoPlayer's own request hitting a genuine 403 just a few
+                    // seconds later on a URL that had *just* passed this exact check. That
+                    // matches an expiring/short-lived token, not a bad URL - so an extra
+                    // network round-trip here only spends part of that window before the
+                    // real request. Trust the URL once cipher solving succeeded; if it truly
+                    // is bad, ExoPlayer's own request fails immediately and the existing
+                    // retry/force-refresh path in MusicService still catches it.
+                    Timber.tag(logTag).d("Skipping validateStatus for PoToken client ${currentClient.clientName} - avoids spending its short-lived token validity window")
+                    Timber.tag(TAG).i("Playback: client=${currentClient.clientName}, videoId=$videoId")
+                    streamValidated = true
+                    winningClient = currentClient
                     break
                 }
 
@@ -332,6 +383,8 @@ object YTPlayerUtils {
                     Timber.tag(logTag).d("Stream validated successfully with client: ${currentClient.clientName}")
                     // Log for release builds
                     Timber.tag(TAG).i("Playback: client=${currentClient.clientName}, videoId=$videoId")
+                    streamValidated = true
+                    winningClient = currentClient
                     break
                 } else {
                     Timber.tag(logTag).d("Stream validation failed for client: ${currentClient.clientName}")
@@ -379,6 +432,19 @@ object YTPlayerUtils {
             throw Exception("Could not find stream url")
         }
 
+        if (!streamValidated) {
+            // Every client's stream failed validateStatus - fail cleanly now (this feeds
+            // the existing retry/auto-skip path in MusicService) rather than handing
+            // ExoPlayer a URL we already know the CDN is likely to reject, which would
+            // otherwise surface as a jarring mid-playback "Source error" instead.
+            Timber.tag(logTag).e("No client's stream URL passed validation - refusing to hand back an unvalidated URL")
+            throw PlaybackException(
+                "Video unavailable",
+                null,
+                PlaybackException.ERROR_CODE_REMOTE_ERROR
+            )
+        }
+
         Timber.tag(logTag).d("Successfully obtained playback data with format: ${format.mimeType}, bitrate: ${format.bitrate}")
         if (isUploadedTrack) {
             println("[PLAYBACK_DEBUG] SUCCESS: Got playback data for uploaded track - format=${format.mimeType}, streamUrl=${streamUrl.take(100)}...")
@@ -390,6 +456,8 @@ object YTPlayerUtils {
             format,
             streamUrl,
             streamExpiresInSeconds,
+            isPoTokenBased = winningClient?.useWebPoTokens == true,
+            streamClient = winningClient?.clientName ?: "",
         )
     }.onFailure { e ->
         println("[PLAYBACK_DEBUG] EXCEPTION during playback for videoId=$videoId: ${e::class.simpleName}: ${e.message}")
@@ -495,8 +563,16 @@ object YTPlayerUtils {
     private fun validateStatus(url: String): Boolean {
         Timber.tag(logTag).d("Validating stream URL status")
         try {
+            // googlevideo.com stream URLs are signed for a specific request shape and
+            // reliably return 403 for a plain HEAD - regardless of whether the URL itself
+            // is valid - because HEAD isn't part of what the signature covers. A ranged GET
+            // (bytes=0-0, i.e. fetch nothing but headers/first byte) is what the CDN
+            // actually expects, and is what ExoPlayer's own requests look like at playback
+            // time. Using HEAD here meant we were discarding perfectly good stream URLs
+            // (including ones that needed no cipher work at all) before ever trying them.
             val requestBuilder = okhttp3.Request.Builder()
-                .head()
+                .get()
+                .header("Range", "bytes=0-0")
                 .url(url)
 
             // Add authentication cookie for privately owned tracks
@@ -505,10 +581,13 @@ object YTPlayerUtils {
                 println("[PLAYBACK_DEBUG] Added cookie to validation request")
             }
 
-            val response = httpClient.newCall(requestBuilder.build()).execute()
-            val isSuccessful = response.isSuccessful
-            Timber.tag(logTag).d("Stream URL validation result: ${if (isSuccessful) "Success" else "Failed"} (${response.code})")
-            return isSuccessful
+            httpClient.newCall(requestBuilder.build()).execute().use { response ->
+                // 206 Partial Content is the expected success response to a ranged GET;
+                // some hosts may still answer 200 (full content, range ignored) - accept both.
+                val isSuccessful = response.code == 200 || response.code == 206
+                Timber.tag(logTag).d("Stream URL validation result: ${if (isSuccessful) "Success" else "Failed"} (${response.code})")
+                return isSuccessful
+            }
         } catch (e: Exception) {
             Timber.tag(logTag).e(e, "Stream URL validation failed with exception")
             reportException(e)
@@ -546,7 +625,7 @@ object YTPlayerUtils {
                     val (playerJs, hash) = PlayerJsFetcher.getPlayerJs()
                         ?: error("PlayerJsFetcher returned null")
                     Timber.tag(logTag).d("Got player.js (hash=$hash), extracting signatureTimestamp")
-                    FunctionNameExtractor.extractSignatureTimestamp(playerJs)
+                    FunctionNameExtractor.extractSignatureTimestamp(playerJs, hash)
                         ?: error("extractSignatureTimestamp returned null for hash=$hash")
                 }.onSuccess { sts ->
                     Timber.tag(logTag).d("Signature timestamp obtained via player.js fallback: $sts")

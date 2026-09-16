@@ -322,6 +322,12 @@ configurations.configureEach {
 }
 
 dependencies {
+    // Standalone TLS provider with an up-to-date CA/cipher set. Unlike Play Services'
+    // ProviderInstaller, this needs no Google Play Services APK on the device, so it's the
+    // fix that actually reaches the "foss"/"izzy" flavors' target devices (de-Googled /
+    // custom ROMs) where ProviderInstaller isn't available. Applies to every flavor.
+    // See App.installModernTlsProvider().
+    implementation(libs.conscrypt.android)
     implementation(libs.guava)
     implementation(libs.coroutines.guava)
     implementation(libs.concurrent.futures)
@@ -363,6 +369,9 @@ dependencies {
     "gmsImplementation"(libs.media3.cast)
     "gmsImplementation"(libs.mediarouter)
     "gmsImplementation"(libs.cast.framework)
+    // Only the "gms" flavor's TlsProviderInstaller.kt references this - keeps "foss"/"izzy"
+    // free of Google Play Services classes entirely (F-Droid compliance).
+    "gmsImplementation"("com.google.android.gms:play-services-basement:18.4.0")
 
     implementation(libs.room.runtime)
     implementation(libs.kuromoji.ipadic)

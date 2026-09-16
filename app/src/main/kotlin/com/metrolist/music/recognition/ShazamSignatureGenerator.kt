@@ -13,8 +13,8 @@ import kotlin.math.max
 /**
  * Pure Kotlin implementation of the Shazam audio fingerprinting algorithm.
  *
- * Ported from the vibra C++ library (https://github.com/marin-m/SongRec) which implements
- * the Shazam signature algorithm using FFT-based audio fingerprinting.
+ * Ported from SongRec / vibra (https://github.com/marin-m/SongRec) which reverse-engineers
+ * the Shazam client signature algorithm using FFT-based audio fingerprinting.
  *
  * This replaces the native C++ + FFTW3 implementation with a pure JVM solution.
  */
@@ -23,13 +23,21 @@ internal object ShazamSignatureGenerator {
     private const val SAMPLE_RATE = 16_000
     private const val FFT_SIZE = 2048
     private const val FFT_OUTPUT_SIZE = FFT_SIZE / 2 + 1  // 1025
+    private const val HOP_SIZE = 128
     private const val MAX_PEAKS = 255
     private const val MAX_TIME_SECONDS = 12.0
 
     // Spread ring buffer size
     private const val RING_BUF_SIZE = 256
 
-    // Band IDs matching FrequencyBand enum in C++ (0=250-520Hz, 1=520-1450Hz, 2=1450-3500Hz, 3=3500-5500Hz)
+    // Peak recognition starts once we have enough history (matches SongRec: >= 46)
+    private const val MIN_SPREADS_FOR_PEAKS = 46
+
+    // Bin range used by SongRec: 10..=1014
+    private const val PEAK_BIN_START = 10
+    private const val PEAK_BIN_END_INCLUSIVE = 1014
+
+    // Band IDs matching FrequencyBand enum (0=250-520Hz, 1=520-1450Hz, 2=1450-3500Hz, 3=3500-5500Hz)
     private const val BAND_250_520 = 0
     private const val BAND_520_1450 = 1
     private const val BAND_1450_3500 = 2
@@ -38,11 +46,22 @@ internal object ShazamSignatureGenerator {
     /**
      * Hanning window: w[i] = 0.5 * (1 - cos(2π*(i+1)/2049)) for i=0..2047.
      *
-     * This matches the precomputed HANNIG_MATRIX values in the C++ hanning.h header.
+     * Equivalent to numpy.hanning(2050)[1:-1] used by SongRec's Python reference.
      */
     private val HANNING = DoubleArray(FFT_SIZE) { i ->
         0.5 * (1.0 - cos(2.0 * PI * (i + 1).toDouble() / 2049.0))
     }
+
+    private val NEIGHBOR_OFFSETS = intArrayOf(-10, -7, -4, -3, 1, 2, 5, 8)
+    private val OTHER_SPREAD_OFFSETS = intArrayOf(
+        -53, -45, 165, 172, 179, 186, 193, 200, 214, 221, 228, 235, 242, 249
+    )
+
+    data class GeneratedSignature(
+        val uri: String,
+        val peakCount: Int,
+        val sampleCount: Int,
+    )
 
     /**
      * Generates a Shazam-compatible audio fingerprint from raw 16-bit PCM samples.
@@ -50,13 +69,18 @@ internal object ShazamSignatureGenerator {
      * @param samples ByteArray of mono PCM audio (16-bit signed little-endian, 16kHz)
      * @return Signature URI string (data:audio/vnd.shazam.sig;base64,...)
      */
-    fun fromI16(samples: ByteArray): String {
+    fun fromI16(samples: ByteArray): String = generate(samples).uri
+
+    /**
+     * Generates the signature and reports how many constellation peaks were found.
+     */
+    fun generate(samples: ByteArray): GeneratedSignature {
         require(samples.size >= 2 && samples.size % 2 == 0) {
             "samples must be a non-empty byte array with even length (16-bit PCM)"
         }
         val pcm = ShortArray(samples.size / 2)
         ByteBuffer.wrap(samples).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(pcm)
-        return SignatureGeneratorState().process(pcm)
+        return SignatureGeneratorState().generate(pcm)
     }
 
     private class SignatureGeneratorState {
@@ -67,7 +91,6 @@ internal object ShazamSignatureGenerator {
         // Circular buffer of FFT magnitude outputs (RING_BUF_SIZE x FFT_OUTPUT_SIZE)
         private val fftOutputs = Array(RING_BUF_SIZE) { DoubleArray(FFT_OUTPUT_SIZE) }
         private var fftPos = 0
-        private var fftNumWritten = 0
 
         // Circular buffer of time-spread FFT outputs (RING_BUF_SIZE x FFT_OUTPUT_SIZE)
         private val spreadFfts = Array(RING_BUF_SIZE) { DoubleArray(FFT_OUTPUT_SIZE) }
@@ -81,20 +104,29 @@ internal object ShazamSignatureGenerator {
         private val bandPeaks = Array(4) { mutableListOf<FrequencyPeak>() }
         private var totalPeaks = 0
 
-        fun process(pcm: ShortArray): String {
+        fun generate(pcm: ShortArray): GeneratedSignature {
+            feedAll(pcm)
+            return GeneratedSignature(
+                uri = encodeSignature(),
+                peakCount = totalPeaks,
+                sampleCount = numSamples,
+            )
+        }
+
+        private fun feedAll(pcm: ShortArray) {
             var offset = 0
-            while (offset + 128 <= pcm.size) {
-                // Match C++ stopping condition: stop when BOTH time≥max AND peaks≥max
+            while (offset + HOP_SIZE <= pcm.size) {
+                // Match SongRec: keep processing while time < max OR peaks < max
+                // (i.e. stop only when BOTH thresholds are met)
                 val elapsedSec = numSamples.toDouble() / SAMPLE_RATE
                 if (elapsedSec >= MAX_TIME_SECONDS && totalPeaks >= MAX_PEAKS) break
 
-                numSamples += 128
-                feedSamples(pcm, offset, 128)
+                numSamples += HOP_SIZE
+                feedSamples(pcm, offset, HOP_SIZE)
                 doFFT()
                 doPeakSpreadingAndRecognition()
-                offset += 128
+                offset += HOP_SIZE
             }
-            return encodeSignature()
         }
 
         private fun feedSamples(pcm: ShortArray, start: Int, count: Int) {
@@ -112,12 +144,12 @@ internal object ShazamSignatureGenerator {
             val result = computeRfft(windowed)
             result.copyInto(fftOutputs[fftPos])
             fftPos = (fftPos + 1) % RING_BUF_SIZE
-            fftNumWritten++
         }
 
         private fun doPeakSpreadingAndRecognition() {
             doPeakSpreading()
-            if (spreadNumWritten >= 47) {
+            // SongRec starts peak recognition once 46 spreads have been written
+            if (spreadNumWritten >= MIN_SPREADS_FOR_PEAKS) {
                 doPeakRecognition()
             }
         }
@@ -132,8 +164,9 @@ internal object ShazamSignatureGenerator {
                 spread[pos] = maxOf(spread[pos], spread[pos + 1], spread[pos + 2])
             }
 
-            // Time spreading: propagate max to/from older spread entries at offsets -1, -3, -6
-            // Only older entries are updated; the new entry keeps only frequency spreading (matches C++).
+            // Time spreading: propagate max to older spread entries at offsets -1, -3, -6.
+            // Matches SongRec Python (chained max across the three former frames).
+            // The new entry keeps only frequency spreading.
             for (pos in 0 until FFT_OUTPUT_SIZE) {
                 var maxVal = spread[pos]
                 for (offset in intArrayOf(-1, -3, -6)) {
@@ -142,9 +175,6 @@ internal object ShazamSignatureGenerator {
                     if (oldVal > maxVal) maxVal = oldVal
                     spreadFfts[idx][pos] = maxVal
                 }
-                // Note: spread[pos] is intentionally NOT updated here.
-                // The new entry stored in spreadFfts should only have frequency spreading applied,
-                // not time spreading. This matches the original C++ vibra implementation.
             }
 
             spread.copyInto(spreadFfts[spreadPos])
@@ -156,23 +186,25 @@ internal object ShazamSignatureGenerator {
             val fftMinus46 = fftOutputs[(fftPos - 46 + RING_BUF_SIZE * 2) % RING_BUF_SIZE]
             val spreadMinus49 = spreadFfts[(spreadPos - 49 + RING_BUF_SIZE * 2) % RING_BUF_SIZE]
 
-            val otherOffsets = intArrayOf(-53, -45, 165, 172, 179, 186, 193, 200, 214, 221, 228, 235, 242, 249)
-
-            for (binPos in 10 until FFT_OUTPUT_SIZE - 8) {
+            // SongRec range: bin_position in 10..=1014
+            for (binPos in PEAK_BIN_START..PEAK_BIN_END_INCLUSIVE) {
                 val fftVal = fftMinus46[binPos]
-                if (fftVal < 1.0 / 64.0 || fftVal < spreadMinus49[binPos]) continue
 
-                // Check 8 neighbors in spreadMinus49
+                // SongRec compares against spreadMinus49[bin_position - 1], NOT bin_position.
+                // Using the wrong index suppresses/creates incorrect peaks and hurts match rate.
+                if (fftVal < 1.0 / 64.0 || fftVal < spreadMinus49[binPos - 1]) continue
+
+                // Frequency-domain local maximum vs 8 neighbors in spreadMinus49
                 var maxNeighborSpread49 = 0.0
-                for (neighborOffset in intArrayOf(-10, -7, -4, -3, 1, 2, 5, 8)) {
+                for (neighborOffset in NEIGHBOR_OFFSETS) {
                     val v = spreadMinus49[binPos + neighborOffset]
                     if (v > maxNeighborSpread49) maxNeighborSpread49 = v
                 }
                 if (fftVal <= maxNeighborSpread49) continue
 
-                // Check 14 other spread FFT offsets
+                // Time-domain local maximum vs other spread FFT offsets
                 var maxNeighborOther = maxNeighborSpread49
-                for (otherOffset in otherOffsets) {
+                for (otherOffset in OTHER_SPREAD_OFFSETS) {
                     val spreadIdx = ((spreadPos + otherOffset) % RING_BUF_SIZE + RING_BUF_SIZE) % RING_BUF_SIZE
                     val v = spreadFfts[spreadIdx][binPos - 1]
                     if (v > maxNeighborOther) maxNeighborOther = v
@@ -182,19 +214,21 @@ internal object ShazamSignatureGenerator {
                 // Valid peak found: compute corrected bin and frequency
                 val fftNumber = spreadNumWritten - 46
 
-                val peakMag = ln(max(1.0 / 64.0, fftVal)) * 1477.3 + 6144
-                val peakMagBefore = ln(max(1.0 / 64.0, fftMinus46[binPos - 1])) * 1477.3 + 6144
-                val peakMagAfter = ln(max(1.0 / 64.0, fftMinus46[binPos + 1])) * 1477.3 + 6144
+                val peakMag = ln(max(1.0 / 64.0, fftVal)) * 1477.3 + 6144.0
+                val peakMagBefore = ln(max(1.0 / 64.0, fftMinus46[binPos - 1])) * 1477.3 + 6144.0
+                val peakMagAfter = ln(max(1.0 / 64.0, fftMinus46[binPos + 1])) * 1477.3 + 6144.0
 
-                val peakVariation1 = peakMag * 2 - peakMagBefore - peakMagAfter
-                val peakVariation2 = (peakMagAfter - peakMagBefore) * 32 / peakVariation1
+                val peakVariation1 = peakMag * 2.0 - peakMagBefore - peakMagAfter
+                // Skip degenerate peaks (division by ~0 would produce nonsense bin offsets)
+                if (peakVariation1 <= 0.0) continue
 
+                val peakVariation2 = (peakMagAfter - peakMagBefore) * 32.0 / peakVariation1
                 val correctedBin = binPos * 64.0 + peakVariation2
                 val frequencyHz = correctedBin * (16000.0 / 2.0 / 1024.0 / 64.0)
 
                 val band = when {
-                    frequencyHz < 250.0  -> continue
-                    frequencyHz < 520.0  -> BAND_250_520
+                    frequencyHz < 250.0 -> continue
+                    frequencyHz < 520.0 -> BAND_250_520
                     frequencyHz < 1450.0 -> BAND_520_1450
                     frequencyHz < 3500.0 -> BAND_1450_3500
                     frequencyHz <= 5500.0 -> BAND_3500_5500

@@ -32,12 +32,14 @@ import com.metrolist.music.di.ApplicationScope
 import com.metrolist.music.extensions.toEnum
 import com.metrolist.music.extensions.toInetSocketAddress
 import com.metrolist.music.utils.CrashHandler
+import com.metrolist.music.utils.TlsProviderInstaller
 import com.metrolist.music.utils.cipher.CipherDeobfuscator
 import com.metrolist.music.utils.dataStore
 import com.metrolist.music.utils.reportException
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -65,6 +67,13 @@ class App :
     override fun onCreate() {
         super.onCreate()
 
+        Timber.plant(Timber.DebugTree())
+
+        // Must run before anything that makes HTTPS calls to hosts with modern cert chains
+        // (e.g. GitHub's raw content servers, which the cipher config feeds are fetched from) -
+        // specifically before CipherDeobfuscator.initialize().
+        installModernTlsProvider()
+
         // Install crash handler first
         CrashHandler.install(this)
 
@@ -80,8 +89,7 @@ class App :
 
         // Initialize cipher deobfuscator for WEB_REMIX streaming
         CipherDeobfuscator.initialize(this)
-
-        Timber.plant(Timber.DebugTree())
+        com.metrolist.music.utils.InnerTubeXPlayer.initialize(this)
 
         // Pre-read Coil cache size on background to avoid runBlocking in newImageLoader
         applicationScope.launch(Dispatchers.IO) {
@@ -90,9 +98,56 @@ class App :
 
         // تهيئة إعدادات التطبيق عند الإقلاع
         applicationScope.launch {
+            // Apply settings (incl. YouTube.proxy) FIRST: the cipher OkHttpClient is built once and
+            // cached, so warming it before the proxy is set would snapshot a null proxy for the
+            // whole session. Warm-up is launched only after this.
             initializeSettings()
+
+            // Warm the cipher WebView off the first-play critical path. Best-effort; on failure the
+            // WebView is created lazily on first play, same as before this call existed.
+            launch(Dispatchers.IO) {
+                delay(1500)
+                runCatching { CipherDeobfuscator.prewarm() }
+            }
+
             observeSettingsChanges()
         }
+    }
+
+    /**
+     * Patches the process-wide TLS security provider so HTTPS to hosts with modern cert
+     * chains (e.g. GitHub/Fastly's raw content servers, used by the cipher config feeds)
+     * validates correctly on old Android (7.x and earlier), whose built-in root cert store
+     * predates chains like Let's Encrypt / ISRG Root X1. Without this, those hosts fail
+     * with `CertPathValidatorException: Trust anchor for certification path not found`
+     * while Google-owned hosts (youtube.com, googlevideo.com) keep working fine, since
+     * those chain through roots Android has trusted for far longer.
+     *
+     * Two layers, because neither alone covers every build variant + device combination:
+     *  1. Conscrypt, installed directly as a JCE Security provider. Pure library, no Google
+     *     Play Services APK required on the device - this is what actually fixes it on the
+     *     "foss"/"izzy" flavors' target devices (F-Droid, de-Googled, custom ROMs).
+     *  2. TlsProviderInstaller.installIfAvailable() - a per-flavor facade (see
+     *     app/src/{gms,foss,izzy}/kotlin/.../utils/TlsProviderInstaller.kt). Only the "gms"
+     *     flavor's copy actually calls Play Services' ProviderInstaller; "foss"/"izzy" have
+     *     a no-op copy so those builds never reference a Google Play Services class (keeps
+     *     them F-Droid-clean - see the "foss" flavor's own build.gradle.kts comment). On
+     *     "gms" devices this can also refresh the provider Play Services itself uses
+     *     elsewhere in the process, which Conscrypt alone doesn't touch.
+     * Both are best-effort: if both fail/no-op, the app continues and cipher config just
+     * falls back to the bundled seed table, same as before either fix existed.
+     */
+    private fun installModernTlsProvider() {
+        try {
+            // insertProviderAt(..., 1) takes priority over the platform's own provider for
+            // all TLS handshakes made from this process from here on.
+            java.security.Security.insertProviderAt(org.conscrypt.Conscrypt.newProvider(), 1)
+            Timber.tag("Metrolist_Security").d("Installed Conscrypt TLS provider")
+        } catch (e: Exception) {
+            Timber.tag("Metrolist_Security").w(e, "Conscrypt provider install failed")
+        }
+
+        TlsProviderInstaller.installIfAvailable(this)
     }
 
     private suspend fun initializeSettings() {
