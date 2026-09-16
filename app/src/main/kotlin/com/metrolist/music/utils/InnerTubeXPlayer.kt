@@ -233,14 +233,8 @@ object InnerTubeXPlayer {
         AndroidPlayerConfigRepository(requireNotNull(applicationContext) { "InnerTubeXPlayer is not initialized" })
     }
 
-    // Christopher's PoTokenGenerator (app/utils/potoken/PoTokenGenerator.kt) has a no-arg
-    // constructor - it reaches Context via CipherDeobfuscator.appContext internally rather
-    // than taking one directly - and getWebClientPoToken() is a blocking call (it runs its
-    // own runBlocking+timeout internally), not a suspend fun. Bridged accordingly below:
-    // constructed with no args, and invoked via withContext(IO) so the blocking call doesn't
-    // tie up whatever dispatcher getPoToken() was called from.
     private val poTokenGenerator: PoTokenGenerator by lazy {
-        PoTokenGenerator()
+        PoTokenGenerator(requireNotNull(applicationContext) { "InnerTubeXPlayer is not initialized" })
     }
 
     private val tokenProvider =
@@ -256,9 +250,7 @@ object InnerTubeXPlayer {
                 visitorData: String,
                 cookie: String?,
             ): PoTokenResult? =
-                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    poTokenGenerator.getWebClientPoToken(videoId, visitorData)
-                }?.let { token ->
+                poTokenGenerator.getWebClientPoToken(videoId, visitorData)?.let { token ->
                     PoTokenResult(
                         playerRequestToken = token.playerRequestPoToken,
                         streamingDataToken = token.streamingDataPoToken,
@@ -267,9 +259,7 @@ object InnerTubeXPlayer {
                 }
 
             override suspend fun close() {
-                // Christopher's PoTokenGenerator has no close() - its WebView is recreated
-                // (and the old one closed) internally on next use, expiry, or error. Nothing
-                // to release here.
+                poTokenGenerator.close()
             }
         }
 
@@ -354,7 +344,6 @@ object InnerTubeXPlayer {
 
     private fun AudioQuality.toInnerTubeX(connectivityManager: ConnectivityManager): InnerTubeXAudioQuality =
         when (this) {
-            AudioQuality.VERY_HIGH -> InnerTubeXAudioQuality.HIGH
             AudioQuality.HIGH -> InnerTubeXAudioQuality.HIGH
             AudioQuality.LOW -> InnerTubeXAudioQuality.LOW
             AudioQuality.AUTO ->

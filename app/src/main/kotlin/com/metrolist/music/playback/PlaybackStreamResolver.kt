@@ -6,6 +6,7 @@ import androidx.media3.common.MediaItem
 import com.metrolist.innertubex.extraction.ContentHints
 import com.metrolist.music.constants.AudioQuality
 import com.metrolist.music.utils.InnerTubeXPlayer
+import com.metrolist.music.utils.markPlaybackClientFailed
 import kotlinx.coroutines.CancellationException
 import timber.log.Timber
 
