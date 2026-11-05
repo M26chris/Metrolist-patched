@@ -14,6 +14,8 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.metrolist.innertube.YouTube
+import com.metrolist.innertube.models.SongItem
+import com.metrolist.innertube.models.YTItem
 import com.metrolist.innertube.models.filterExplicit
 import com.metrolist.innertube.models.filterVideoSongs
 import com.metrolist.innertube.models.filterYoutubeShorts
@@ -27,6 +29,8 @@ import com.metrolist.music.utils.get
 import com.metrolist.music.utils.reportException
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import java.net.URLDecoder
@@ -48,18 +52,64 @@ constructor(
     var summaryPage by mutableStateOf<SearchSummaryPage?>(null)
     val viewStateMap = mutableStateMapOf<String, ItemsPage?>()
 
+    private suspend fun resolveSearchMetadata(items: List<YTItem>): List<YTItem> =
+        coroutineScope {
+            val knownDurations =
+                items
+                    .filterIsInstance<SongItem>()
+                    .mapNotNull { song -> song.duration?.let { song.id to it } }
+                    .toMap()
+            val missingDurationIds =
+                items
+                    .filterIsInstance<SongItem>()
+                    .filter { it.duration == null && it.id !in knownDurations }
+                    .map { it.id }
+                    .distinct()
+            val resolvedArtists = async { YouTube.resolveArtistIds(items) }
+            val fetchedDurations =
+                async {
+                    if (missingDurationIds.isEmpty()) {
+                        emptyMap()
+                    } else {
+                        YouTube
+                            .queue(videoIds = missingDurationIds)
+                            .getOrDefault(emptyList())
+                            .mapNotNull { song -> song.duration?.let { song.id to it } }
+                            .toMap()
+                    }
+                }
+            val durations = knownDurations + fetchedDurations.await()
+
+            resolvedArtists.await().map { item ->
+                if (item is SongItem && item.duration == null) {
+                    item.copy(duration = durations[item.id])
+                } else {
+                    item
+                }
+            }
+        }
+
     private suspend fun loadSummaryPage() {
         if (summaryPage == null) {
             android.util.Log.d("SEARCH_DEBUG", "loadSummaryPage: starting search for query=$query")
                     YouTube
                         .searchSummary(query)
                         .onSuccess { page ->
-                            android.util.Log.d("SEARCH_DEBUG", "loadSummaryPage: SUCCESS, summaries=${page.summaries.size}")
+                            val resolvedItems = resolveSearchMetadata(page.summaries.flatMap { it.items })
+                            var offset = 0
+                            val resolvedPage = page.copy(
+                                summaries = page.summaries.map { summary ->
+                                    val nextOffset = offset + summary.items.size
+                                    val resolvedSummary = summary.copy(items = resolvedItems.subList(offset, nextOffset))
+                                    offset = nextOffset
+                                    resolvedSummary
+                                },
+                            )
                             val hideExplicit = context.dataStore.get(HideExplicitKey, false)
                             val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
                             val hideYoutubeShorts = context.dataStore.get(HideYoutubeShortsKey, false)
                             summaryPage =
-                                page.filterExplicit(hideExplicit)
+                                resolvedPage.filterExplicit(hideExplicit)
                                   .filterVideoSongs(hideVideoSongs)
                                   .filterYoutubeShorts(hideYoutubeShorts)
                             android.util.Log.d("SEARCH_DEBUG", "loadSummaryPage: summaryPage set, sections=${summaryPage?.summaries?.size}")
@@ -97,7 +147,7 @@ constructor(
                         YouTube
                             .search(query, filter)
                             .onSuccess { result ->
-                                val resolvedItems = YouTube.resolveArtistIds(result.items)
+                                val resolvedItems = resolveSearchMetadata(result.items)
                                 val hideExplicit = context.dataStore.get(HideExplicitKey, false)
                                 val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
                                 val hideYoutubeShorts = context.dataStore.get(HideYoutubeShortsKey, false)
@@ -127,7 +177,7 @@ constructor(
             val continuation = viewState.continuation ?: return@launch
             val searchResult =
                 YouTube.searchContinuation(continuation).getOrNull() ?: return@launch
-            val resolvedItems = YouTube.resolveArtistIds(searchResult.items)
+            val resolvedItems = resolveSearchMetadata(searchResult.items)
             val hideExplicit = context.dataStore.get(HideExplicitKey, false)
             val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
             val hideYoutubeShorts = context.dataStore.get(HideYoutubeShortsKey, false)

@@ -36,7 +36,14 @@ import kotlin.io.encoding.ExperimentalEncodingApi
  */
 @OptIn(ExperimentalEncodingApi::class)
 class InnerTube {
-    private var httpClient = createClient()
+    // internal (not private) + generation counter: exposed so YouTube.extractionTransport()
+    // can hand this exact, already-TLS-hardened/cookie-aware client to InnerTubeXPlayer's
+    // extractor instead of building a second, parallel one that could drift out of sync
+    // with cookie/proxy state or the Android 7 TLS config below.
+    internal var httpClient = createClient()
+        private set
+    internal var generation: Long = 0L
+        private set
 
     var locale = YouTubeLocale(
         gl = Locale.getDefault().country,
@@ -48,6 +55,7 @@ class InnerTube {
         set(value) {
             field = value
             cookieMap = if (value == null) emptyMap() else parseCookieString(value)
+            generation++
         }
     private var cookieMap = emptyMap<String, String>()
 
@@ -56,6 +64,7 @@ class InnerTube {
             field = value
             httpClient.close()
             httpClient = createClient()
+            generation++
         }
     
     var proxyAuth: String? = null

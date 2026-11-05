@@ -145,6 +145,10 @@ fun RecognitionScreen(
         }
 
     fun startRecognition() {
+        val current = com.metrolist.music.recognition.MusicRecognitionService.recognitionStatus.value
+        if (current is RecognitionStatus.Listening || current is RecognitionStatus.Processing) {
+            return
+        }
         if (hasPermission) {
             coroutineScope.launch {
                 com.metrolist.music.recognition.MusicRecognitionService
